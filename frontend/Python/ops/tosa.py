@@ -731,6 +731,63 @@ def bmm_op(node: BatchMatmulOp, symbol_table) -> ir.Operation:
     return op
 
 
+def _complex_binary(input1, input2, shape, dtype, op_func, alpha=1):
+    """Lower complex arithmetic without passing complex types to TOSA."""
+    inputs = [x for x in (input1, input2) if isinstance(x, ir.Value)]
+    maps = []
+    for value in inputs:
+        value_type = ir.RankedTensorType(value.type)
+        if value_type.element_type != dtype:
+            raise NotImplementedError(
+                "complex arithmetic requires matching dtypes"
+            )
+        rank = len(value_type.shape)
+        exprs = [
+            ir.AffineConstantExpr.get(0)
+            if size == 1
+            else ir.AffineDimExpr.get(len(shape) - rank + dim)
+            for dim, size in enumerate(value_type.shape)
+        ]
+        maps.append(
+            ir.AffineMapAttr.get(ir.AffineMap.get(len(shape), 0, exprs))
+        )
+    maps.append(ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(shape))))
+    output = tensor.EmptyOp(shape, dtype)
+    op = linalg.GenericOp(
+        [ir.RankedTensorType.get(shape, dtype)],
+        inputs,
+        [output.result],
+        ir.ArrayAttr.get(maps),
+        ir.ArrayAttr.get(
+            [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * len(shape)
+        ),
+    )
+    block = ir.Block.create_at_start(op.region, [dtype] * (len(inputs) + 1))
+    with ir.InsertionPoint(block):
+
+        def constant(value):
+            value = complex(value)
+            real_type = ir.ComplexType(dtype).element_type
+            real = arith.ConstantOp(
+                real_type, ir.FloatAttr.get(real_type, value.real)
+            ).result
+            imag = arith.ConstantOp(
+                real_type, ir.FloatAttr.get(real_type, value.imag)
+            ).result
+            return complex_dialect.CreateOp(dtype, real, imag).result
+
+        arguments = iter(block.arguments)
+        lhs, rhs = [
+            next(arguments) if isinstance(x, ir.Value) else constant(x)
+            for x in (input1, input2)
+        ]
+        if alpha != 1:
+            rhs = complex_dialect.MulOp(rhs, constant(alpha)).result
+        result = op_func(lhs, rhs).result
+        linalg.YieldOp([result])
+    return op
+
+
 def add_op(node: AddOp, symbol_table):
     """
     Import tensor addition operation.
@@ -740,6 +797,15 @@ def add_op(node: AddOp, symbol_table):
     input2 = symbol_table.get((str(node.args[1]), 0), node.args[1])
     dtype = node.tensor_meta["dtype"]
     mlir_dtype = mlir_element_type_get(dtype)
+    if isinstance(mlir_dtype, ir.ComplexType):
+        return _complex_binary(
+            input1,
+            input2,
+            list(node.tensor_meta["shape"]),
+            mlir_dtype,
+            complex_dialect.AddOp,
+            node.kwargs.get("alpha", 1),
+        )
     if isinstance(node.args[0], str) and isinstance(node.args[1], str):
         input1_dtype = ir.RankedTensorType(input1.type).element_type
         input2_dtype = ir.RankedTensorType(input2.type).element_type
@@ -822,6 +888,15 @@ def mul_op(node: MulOp, symbol_table):
     output_shape = list(node.tensor_meta["shape"])
     dtype = node.tensor_meta["dtype"]
     mlir_dtype = mlir_element_type_get(dtype)
+
+    if isinstance(mlir_dtype, ir.ComplexType):
+        return _complex_binary(
+            symbol_table.get((str(node.args[0]), 0), node.args[0]),
+            symbol_table.get((str(node.args[1]), 0), node.args[1]),
+            output_shape,
+            mlir_dtype,
+            complex_dialect.MulOp,
+        )
 
     if isinstance(node.args[0], str):
         input1 = symbol_table.get((str(node.args[0]), 0), node.args[0])
@@ -2556,6 +2631,54 @@ def reshape_op(node: ReshapeOp, symbol_table):
     return _reshape_or_extract_for_complex(input1, new_shape)
 
 
+def _complex_dtype_view(input_tensor, out_shape, out_dtype):
+    """Reinterpret interleaved real/imaginary lanes along the last dimension."""
+    input_type = ir.RankedTensorType(input_tensor.type)
+    unpack = isinstance(input_type.element_type, ir.ComplexType)
+    complex_type = input_type.element_type if unpack else out_dtype
+    real_type = out_dtype if unpack else input_type.element_type
+    if ir.ComplexType(complex_type).element_type != real_type:
+        raise NotImplementedError(
+            "complex views require matching component types"
+        )
+    rank = len(out_shape)
+    output = tensor.EmptyOp(out_shape, out_dtype)
+    op = linalg.GenericOp(
+        [ir.RankedTensorType.get(out_shape, out_dtype)],
+        [],
+        [output.result],
+        ir.ArrayAttr.get(
+            [ir.AffineMapAttr.get(ir.AffineMap.get_identity(rank))]
+        ),
+        ir.ArrayAttr.get(
+            [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * rank
+        ),
+    )
+    block = ir.Block.create_at_start(op.region, [out_dtype])
+    with ir.InsertionPoint(block):
+        indices = [linalg.IndexOp(dim).result for dim in range(rank)]
+        index_type = ir.IndexType.get()
+        two = arith.ConstantOp(index_type, 2).result
+        if unpack:
+            lane = arith.RemUIOp(indices[-1], two).result
+            indices[-1] = arith.DivUIOp(indices[-1], two).result
+            value = tensor.ExtractOp(input_tensor, indices).result
+            real = complex_dialect.ReOp(value).result
+            imag = complex_dialect.ImOp(value).result
+            zero = arith.ConstantOp(index_type, 0).result
+            is_real = arith.CmpIOp(arith.CmpIPredicate.eq, lane, zero).result
+            value = arith.SelectOp(is_real, real, imag).result
+        else:
+            indices[-1] = arith.MulIOp(indices[-1], two).result
+            real = tensor.ExtractOp(input_tensor, indices).result
+            one = arith.ConstantOp(index_type, 1).result
+            indices[-1] = arith.AddIOp(indices[-1], one).result
+            imag = tensor.ExtractOp(input_tensor, indices).result
+            value = complex_dialect.CreateOp(out_dtype, real, imag).result
+        linalg.YieldOp([value])
+    return op
+
+
 def view_dtype_op(node: ViewDtypeOp, symbol_table):
     input_tensor = symbol_table.get((str(node.args[0]), 0))
     if input_tensor is None:
@@ -2564,7 +2687,34 @@ def view_dtype_op(node: ViewDtypeOp, symbol_table):
     out_shape = list(node.tensor_meta["shape"])
     out_dtype = mlir_element_type_get(node.tensor_meta["dtype"])
     out_type = ir.RankedTensorType.get(out_shape, out_dtype)
-    return tensor.BitcastOp(out_type, input_tensor)
+    input_type = ir.RankedTensorType(input_tensor.type)
+    if input_type.element_type == out_dtype:
+        return input_tensor
+    if isinstance(input_type.element_type, ir.ComplexType) or isinstance(
+        out_dtype, ir.ComplexType
+    ):
+        return _complex_dtype_view(input_tensor, out_shape, out_dtype)
+    if input_type.element_type.width != out_dtype.width:
+        raise NotImplementedError("view.dtype requires equal element widths")
+    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(out_shape)))
+    output = tensor.EmptyOp(out_shape, out_dtype)
+    op = linalg.GenericOp(
+        [out_type],
+        [input_tensor],
+        [output.result],
+        ir.ArrayAttr.get([identity, identity]),
+        ir.ArrayAttr.get(
+            [ir.Attribute.parse("#linalg.iterator_type<parallel>")]
+            * len(out_shape)
+        ),
+    )
+    block = ir.Block.create_at_start(
+        op.region, [input_type.element_type, out_dtype]
+    )
+    with ir.InsertionPoint(block):
+        value = arith.BitcastOp(out_dtype, block.arguments[0]).result
+        linalg.YieldOp([value])
+    return op
 
 
 def _build_reassociation_attr(groups):
@@ -3281,6 +3431,11 @@ def sum_op(node: SumDimOp, symbol_table):
 
     input_shape = list(ir.RankedTensorType(input_tensor.type).shape)
     input_dtype = ir.RankedTensorType(input_tensor.type).element_type
+
+    if 0 in input_shape:
+        output_shape = list(node.tensor_meta["shape"])
+        output_dtype = mlir_element_type_get(node.tensor_meta["dtype"])
+        return _scalar_to_tensor(0, output_dtype, output_shape)
 
     target_dtype = None
     if getattr(node, "kwargs", None):

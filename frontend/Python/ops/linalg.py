@@ -2729,7 +2729,7 @@ def split_op(node: SplitOp, symbol_table):
     input_tensor = symbol_table.get((str(node.args[0]), 0), node.args[0])
     split_size = node.args[1]  # Size of each split tensor
     input_shape = input_tensor.type.shape
-    dim = node.args[2]  # Dimension to split along
+    dim = node.args[2] if len(node.args) > 2 else node.kwargs.get("dim", 0)
     if dim < 0:
         dim += len(input_shape)
 

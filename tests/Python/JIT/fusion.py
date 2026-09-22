@@ -29,14 +29,12 @@ class TestFusion(unittest.TestCase):
                 compiler.importer_by_export(model, a, b)
                 execute = compiler.dynamo_run()
                 retained = execute(a, b)
-                expected = [x.float() for x in model(a, b)]
+                expected = list(model(a, b))
                 torch.testing.assert_close(retained, expected)
                 backing = torch.zeros(16, 64, dtype=dtype)
                 backing[:, ::2] = a + 1
                 other = execute(backing[:, ::2], b)
-                torch.testing.assert_close(
-                    other, [x.float() for x in model(a + 1, b)]
-                )
+                torch.testing.assert_close(other, list(model(a + 1, b)))
                 torch.testing.assert_close(retained, expected)
 
 
