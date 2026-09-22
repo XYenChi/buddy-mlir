@@ -742,10 +742,18 @@ class Graph:
             element_dtype=element_dtype,
         )
 
-    def lower_to_llvm_ir(self):
+    def lower_to_llvm_ir(
+        self, *, matmul_vector_size: int = 32, matmul_vector_type: str = "fixed"
+    ):
         """
         Lower graph to llvm ir.
+
+        Scalable matmul vectors require support from the compilation target.
         """
+        if type(matmul_vector_size) is not int or matmul_vector_size <= 0:
+            raise ValueError("matmul_vector_size must be a positive integer")
+        if matmul_vector_type not in ("fixed", "scalable"):
+            raise ValueError("matmul_vector_type must be fixed or scalable")
         if self._imported_module is None:
             self.lower_to_top_level_ir()
 
@@ -774,7 +782,12 @@ class Graph:
             pm.add("func.func(eliminate-memref-copy)")
             pm.add("func.func(assume-tight-memref-layout)")
             pm.add("func.func(staticize-memref-layout)")
-            pm.add("matmul-vectorization")
+            pm.add(
+                "matmul-vectorization{"
+                f"vector-size={matmul_vector_size} "
+                f"vector-type={matmul_vector_type}"
+                "}"
+            )
             pm.add("convert-linalg-to-affine-loops")
             pm.add("convert-vector-to-scf")
             pm.add("lower-affine")
@@ -798,12 +811,17 @@ class Graph:
             pm.add("reconcile-unrealized-casts")
             pm.run(self._imported_module.operation)
 
-    def compile(self):
+    def compile(
+        self, *, matmul_vector_size: int = 32, matmul_vector_type: str = "fixed"
+    ):
         """
         Compile graph from Buddy Graph to LLVM IR.
         """
         self.lower_to_top_level_ir()
-        self.lower_to_llvm_ir()
+        self.lower_to_llvm_ir(
+            matmul_vector_size=matmul_vector_size,
+            matmul_vector_type=matmul_vector_type,
+        )
 
 
 class GraphImporter:

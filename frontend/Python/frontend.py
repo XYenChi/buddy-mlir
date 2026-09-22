@@ -1307,7 +1307,10 @@ class DynamoCompiler:
         self._compile_fx(exported_program.graph_module, list(args))
         return self._imported_graphs
 
-    def _dynamo_run_for_graph(self, graph):
+    def _dynamo_run_for_graph(
+        self, graph, *, matmul_vector_size: int = 32,
+        matmul_vector_type: str = "fixed",
+    ):
         """
         Build an execution callable for a specific Buddy graph.
         """
@@ -1371,7 +1374,10 @@ class DynamoCompiler:
 
             return os.path.join(lib_base_path, "libomp" + lib_extension)
 
-        graph.compile()
+        graph.compile(
+            matmul_vector_size=matmul_vector_size,
+            matmul_vector_type=matmul_vector_type,
+        )
 
         # Collect dependency libraries.
         lib_extension = get_lib_extension()
@@ -1417,16 +1423,26 @@ class DynamoCompiler:
 
         return _TorchExecution(ee, graph)
 
-    def dynamo_run(self):
+    def dynamo_run(
+        self, *, matmul_vector_size: int = 32, matmul_vector_type: str = "fixed"
+    ):
         """
         Return a callable for the most recently imported graph.
 
         The callable caches JIT argument descriptors per thread and refreshes
         their input addresses on each invocation.
+
+        matmul_vector_size and matmul_vector_type configure matmul lowering.
+        For example, size 4 with type "scalable" is useful on RVV targets.
+        The caller must ensure the execution target supports scalable vectors.
         """
         # Dynamo's graph break may import more than one graph.
         graph = self._imported_graphs[-1]
-        return self._dynamo_run_for_graph(graph)
+        return self._dynamo_run_for_graph(
+            graph,
+            matmul_vector_size=matmul_vector_size,
+            matmul_vector_type=matmul_vector_type,
+        )
 
 
 class TorchCompileBackend:
