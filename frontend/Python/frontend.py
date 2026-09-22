@@ -1466,6 +1466,46 @@ class DynamoCompiler:
         )
 
 
+def _specialization_key(args, tensors):
+    """Include layout and alias relationships in the concrete graph cache key."""
+    return tuple(
+        (
+            x.shape,
+            x.stride(),
+            x.storage_offset(),
+            x.dtype,
+            x.device,
+            x.requires_grad,
+        )
+        if isinstance(x, torch.Tensor)
+        else (type(x), x)
+        for x in args
+    ) + tuple(
+        torch._C._is_alias_of(x, y)
+        for i, x in enumerate(tensors)
+        for y in tensors[:i]
+    )
+
+
+def _specialize_graph(gm, args):
+    """Replace scalar placeholders with concrete values in a graph copy."""
+    concrete = torch.fx.GraphModule(gm, copy.deepcopy(gm.graph))
+    placeholders = [n for n in concrete.graph.nodes if n.op == "placeholder"]
+    for node, value in zip(placeholders, args):
+        if isinstance(value, torch.Tensor):
+            continue
+
+        def replace(n, value=value, node=node):
+            return value if n is node else n
+
+        for user in list(node.users):
+            user.args = torch.fx.map_arg(user.args, replace)
+            user.kwargs = torch.fx.map_arg(user.kwargs, replace)
+        concrete.graph.erase_node(node)
+    concrete.recompile()
+    return concrete
+
+
 class TorchCompileBackend:
     """
     TorchDynamo backend wrapper for `torch.compile(backend=...)`.
@@ -1493,48 +1533,11 @@ class TorchCompileBackend:
 
             def specialize(*args):
                 tensors = [x for x in args if isinstance(x, torch.Tensor)]
-                key = tuple(
-                    (
-                        x.shape,
-                        x.stride(),
-                        x.storage_offset(),
-                        x.dtype,
-                        x.device,
-                        x.requires_grad,
-                    )
-                    if isinstance(x, torch.Tensor)
-                    else (type(x), x)
-                    for x in args
-                ) + tuple(
-                    torch._C._is_alias_of(x, y)
-                    for i, x in enumerate(tensors)
-                    for y in tensors[:i]
-                )
+                key = _specialization_key(args, tensors)
                 with lock:
                     executable = cache.get(key)
                     if executable is None:
-                        concrete = torch.fx.GraphModule(
-                            gm, copy.deepcopy(gm.graph)
-                        )
-                        placeholders = [
-                            n
-                            for n in concrete.graph.nodes
-                            if n.op == "placeholder"
-                        ]
-                        for node, value in zip(placeholders, args):
-                            if isinstance(value, torch.Tensor):
-                                continue
-                            for user in list(node.users):
-
-                                def replace(n, value=value, node=node):
-                                    return value if n is node else n
-
-                                user.args = torch.fx.map_arg(user.args, replace)
-                                user.kwargs = torch.fx.map_arg(
-                                    user.kwargs, replace
-                                )
-                            concrete.graph.erase_node(node)
-                        concrete.recompile()
+                        concrete = _specialize_graph(gm, args)
                         self._compiler._imported_graphs = []
                         self._compiler._imported_params = {}
                         executable = self._compiler._compile_fx(

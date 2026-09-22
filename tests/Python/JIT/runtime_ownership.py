@@ -3,6 +3,7 @@
 
 import ctypes
 import gc
+import unittest
 import weakref
 from unittest.mock import patch
 
@@ -38,59 +39,64 @@ class AllocatingEngine(AliasEngine):
             target.aligned = ctypes.cast(address, type(target.aligned))
 
 
-x = torch.arange(8, dtype=torch.float32)
-engine = AllocatingEngine(np.zeros(8, dtype=np.float32))
-execute = _TorchExecution(engine, engine.graph)
-released = []
-free = execute.allocators.libc.free
+class TestOutputOwnership(unittest.TestCase):
+    def make_execution(self):
+        engine = AllocatingEngine(np.zeros(8, dtype=np.float32))
+        execute = _TorchExecution(engine, engine.graph)
+        released = []
+        free = execute.allocators.libc.free
+
+        def counted_free(address):
+            released.append(address)
+            free(address)
+
+        execute.allocators.libc.free = counted_free
+        return execute, engine, released
+
+    def test_shared_storage_keeps_allocation_and_engine_alive(self):
+        execute, engine, released = self.make_execution()
+        x = torch.arange(8, dtype=torch.float32)
+        first, second = execute(x)
+        torch.testing.assert_close(first, x)
+        self.assertTrue(torch._C._is_alias_of(first, second))
+        view = second[2:]
+        engine_ref = weakref.ref(engine)
+        del first, second, execute, engine
+        gc.collect()
+        self.assertFalse(released)
+        self.assertIsNotNone(engine_ref())
+        torch.testing.assert_close(view, x[2:])
+        del view
+        gc.collect()
+        self.assertEqual(len(released), 1)
+        self.assertIsNone(engine_ref())
+
+    def test_conversion_failure_releases_outputs(self):
+        execute, _, released = self.make_execution()
+        x = torch.arange(8, dtype=torch.float32)
+        with (
+            patch.object(
+                rt,
+                "ranked_memref_to_numpy",
+                side_effect=RuntimeError("conversion failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "conversion failed"),
+        ):
+            execute(x)
+        gc.collect()
+        self.assertEqual(len(released), 1)
+        self.assertFalse(execute.allocators.live)
+
+    def test_borrowed_input_is_not_freed(self):
+        execute, engine, released = self.make_execution()
+        execute.function = lambda packed: AliasEngine.call(engine, packed)
+        x = torch.arange(8, dtype=torch.float32)
+        first, second = execute(x)
+        torch.testing.assert_close(first, x)
+        del first, second
+        gc.collect()
+        self.assertFalse(released)
 
 
-def counted_free(address):
-    released.append(address)
-    free(address)
-
-
-execute.allocators.libc.free = counted_free
-first, second = execute(x)
-torch.testing.assert_close(first, x)
-assert torch._C._is_alias_of(first, second)
-view = second[2:]
-ref = weakref.ref(engine)
-del first, second, execute, engine
-gc.collect()
-assert not released and ref() is not None
-torch.testing.assert_close(view, x[2:])
-del view
-gc.collect()
-assert len(released) == 1, released
-assert ref() is None
-print("Native shared output ownership PASS")
-
-# A failed result conversion must release already-adopted native allocations.
-engine = AllocatingEngine(np.zeros(8, dtype=np.float32))
-execute = _TorchExecution(engine, engine.graph)
-released.clear()
-execute.allocators.libc.free = counted_free
-with patch.object(
-    rt, "ranked_memref_to_numpy", side_effect=RuntimeError("conversion failed")
-):
-    try:
-        execute(x)
-    except RuntimeError as error:
-        assert str(error) == "conversion failed"
-    else:
-        raise AssertionError("conversion failure was swallowed")
-gc.collect()
-assert len(released) == 1
-assert not execute.allocators.live
-
-# A borrowed input is never adopted or freed by the native allocator tracker.
-engine.call = lambda packed: AliasEngine.call(engine, packed)
-execute.function = engine.call
-released.clear()
-first, second = execute(x)
-torch.testing.assert_close(first, x)
-del first, second
-gc.collect()
-assert not released
-print("Conversion failure cleanup and borrowed input exclusion PASS")
+if __name__ == "__main__":
+    unittest.main()

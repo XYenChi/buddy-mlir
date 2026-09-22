@@ -166,6 +166,54 @@ class _CallFrame:
         )
 
 
+def _copy_tensor_input(tensor):
+    """Create an isolated, contiguous ABI buffer without changing BF16 bits."""
+    if tensor.device.type != "cpu":
+        tensor = tensor.cpu()
+    if tensor.dtype == torch.bfloat16:
+        array = tensor.contiguous().view(torch.int16).numpy().view(np.uint16)
+        return array.copy()
+    if not tensor.is_contiguous():
+        # contiguous() already owns a copy; NumPy retains that Tensor.
+        return tensor.contiguous().numpy()
+    return np.array(tensor.numpy(), copy=True)
+
+
+def _array_end(array):
+    """Return the byte address just past a nonnegative-stride array."""
+    if not array.size:
+        return array.ctypes.data
+    span = sum(
+        (size - 1) * stride for size, stride in zip(array.shape, array.strides)
+    )
+    return array.ctypes.data + span + array.itemsize
+
+
+def _output_tensors(arrays, copy_storage):
+    """Build Tensor views sharing one storage for a native allocation."""
+    if len(arrays) == 1:
+        array = arrays[0].copy() if copy_storage else arrays[0]
+        return [torch.from_numpy(array)]
+
+    start = min(array.ctypes.data for array in arrays)
+    end = max(_array_end(array) for array in arrays)
+    buffer = (ctypes.c_byte * (end - start)).from_address(start)
+    storage = np.frombuffer(buffer, dtype=arrays[0].dtype).view(_OwnedArray)
+    storage.owner = tuple(arrays)
+    base = torch.from_numpy(storage)
+    if copy_storage:
+        # JIT globals may be read-only and must not be mutated by callers.
+        base = base.clone()
+    return [
+        base.as_strided(
+            array.shape,
+            tuple(stride // array.itemsize for stride in array.strides),
+            (array.ctypes.data - start) // array.itemsize,
+        )
+        for array in arrays
+    ]
+
+
 class _TorchExecution:
     """Execute a Buddy graph with one reusable call frame per Python thread."""
 
@@ -178,25 +226,7 @@ class _TorchExecution:
         self.local = threading.local()
 
     def __call__(self, *args):
-        arrays = []
-        for tensor in args:
-            if tensor.device.type != "cpu":
-                tensor = tensor.cpu()
-            if tensor.dtype == torch.bfloat16:
-                # Transfer raw BF16 bits without widening or canonicalizing NaNs.
-                array = (
-                    tensor.contiguous()
-                    .view(torch.int16)
-                    .numpy()
-                    .view(np.uint16)
-                )
-                arrays.append(array.copy())
-            elif not tensor.is_contiguous():
-                # contiguous() already creates an isolated buffer. NumPy keeps
-                # its owning Tensor alive, so a second input copy is redundant.
-                arrays.append(tensor.contiguous().numpy())
-            else:
-                arrays.append(np.array(tensor.numpy(), copy=True))
+        arrays = [_copy_tensor_input(tensor) for tensor in args]
 
         signature = tuple(
             (array.dtype, array.shape, array.strides) for array in arrays
@@ -217,114 +247,76 @@ class _TorchExecution:
                 descriptor.allocated = address
                 aligned.value = address
             self.function(frame.packed)
-            outputs = []
-            owners_by_address = {}
-            if self.allocators is not None:
-                # Adopt all returned allocations before any conversion can fail.
-                for descriptor in frame.output_descriptors:
-                    address = descriptor.allocated
-                    if (
-                        address not in addresses
-                        and address not in owners_by_address
-                    ):
-                        owners_by_address[address] = self.allocators.adopt(
-                            address, self.engine
-                        )
-            for descriptor, pointer in zip(
-                frame.output_descriptors, frame.output_pointers
-            ):
-                out = rt.ranked_memref_to_numpy(pointer)
-                if isinstance(out, np.ndarray):
-                    owners = tuple(
-                        array
-                        for array, address in zip(arrays, addresses)
-                        if descriptor.allocated == address
-                    )
-                    if owners:
-                        out = out.view(_InputBackedArray)
-                        out.inputs = owners
-                    elif (
-                        owners_by_address.get(descriptor.allocated) is not None
-                    ):
-                        out = out.view(_OwnedArray)
-                        out.owner = owners_by_address[descriptor.allocated]
-                    else:
-                        # Borrowed globals must keep their JIT engine alive too.
-                        out = out.view(_OwnedArray)
-                        out.owner = self.engine
-                outputs.append(out)
-            # Repeated from_numpy calls create distinct StorageImpl objects even
-            # for the same allocation. Build one storage for shared native
-            # outputs so Torch can observe aliasing, not just matching pointers.
-            groups = {}
-            for index, (out, descriptor) in enumerate(
-                zip(outputs, frame.output_descriptors)
-            ):
-                if isinstance(out, np.ndarray):
-                    address = descriptor.allocated
-                    if (
-                        address not in addresses
-                        and owners_by_address.get(address) is None
-                    ):
-                        address = ctypes.cast(
-                            descriptor.aligned, ctypes.c_void_p
-                        ).value
-                    groups.setdefault((address, out.dtype), []).append(index)
-                else:
-                    outputs[index] = torch.tensor(out)
-            for indices in groups.values():
-                arrays_out = [outputs[i] for i in indices]
-                address = frame.output_descriptors[indices[0]].allocated
-                borrowed_global = (
-                    address not in addresses
-                    and owners_by_address.get(address) is None
-                )
-                if len(indices) == 1:
-                    # A tensor constant must be writable without mutating (or
-                    # writing into read-only) JIT global storage.
-                    array = (
-                        arrays_out[0].copy()
-                        if borrowed_global
-                        else arrays_out[0]
-                    )
-                    tensors = [torch.from_numpy(array)]
-                else:
-                    start = min(a.ctypes.data for a in arrays_out)
-                    end = max(
-                        a.ctypes.data
-                        + (
-                            sum(
-                                (n - 1) * stride
-                                for n, stride in zip(a.shape, a.strides)
-                            )
-                            + a.itemsize
-                            if a.size
-                            else 0
-                        )
-                        for a in arrays_out
-                    )
-                    buffer = (ctypes.c_byte * (end - start)).from_address(start)
-                    storage = np.frombuffer(
-                        buffer, dtype=arrays_out[0].dtype
-                    ).view(_OwnedArray)
-                    storage.owner = tuple(arrays_out)
-                    base = torch.from_numpy(storage)
-                    if borrowed_global:
-                        base = base.clone()
-                    tensors = [
-                        base.as_strided(
-                            a.shape,
-                            tuple(s // a.itemsize for s in a.strides),
-                            (a.ctypes.data - start) // a.itemsize,
-                        )
-                        for a in arrays_out
-                    ]
-                for index, array, result in zip(indices, arrays_out, tensors):
-                    outputs[index] = (
-                        result.view(torch.bfloat16)
-                        if array.dtype == np.uint16
-                        else result
-                    )
-            return outputs
+            return self._convert_outputs(frame, arrays, addresses)
         finally:
             frame.active = False
+
+    def _convert_outputs(self, frame, arrays, addresses):
+        outputs = []
+        owners_by_address = {}
+        if self.allocators is not None:
+            # Adopt all returned allocations before any conversion can fail.
+            for descriptor in frame.output_descriptors:
+                address = descriptor.allocated
+                if (
+                    address not in addresses
+                    and address not in owners_by_address
+                ):
+                    owners_by_address[address] = self.allocators.adopt(
+                        address, self.engine
+                    )
+        for descriptor, pointer in zip(
+            frame.output_descriptors, frame.output_pointers
+        ):
+            out = rt.ranked_memref_to_numpy(pointer)
+            if isinstance(out, np.ndarray):
+                owners = tuple(
+                    array
+                    for array, address in zip(arrays, addresses)
+                    if descriptor.allocated == address
+                )
+                if owners:
+                    out = out.view(_InputBackedArray)
+                    out.inputs = owners
+                elif owners_by_address.get(descriptor.allocated) is not None:
+                    out = out.view(_OwnedArray)
+                    out.owner = owners_by_address[descriptor.allocated]
+                else:
+                    # Borrowed globals must keep their JIT engine alive too.
+                    out = out.view(_OwnedArray)
+                    out.owner = self.engine
+            outputs.append(out)
+        # Repeated from_numpy calls create distinct StorageImpl objects even
+        # for the same allocation. Build one storage for shared native
+        # outputs so Torch can observe aliasing, not just matching pointers.
+        groups = {}
+        for index, (out, descriptor) in enumerate(
+            zip(outputs, frame.output_descriptors)
+        ):
+            if isinstance(out, np.ndarray):
+                address = descriptor.allocated
+                if (
+                    address not in addresses
+                    and owners_by_address.get(address) is None
+                ):
+                    address = ctypes.cast(
+                        descriptor.aligned, ctypes.c_void_p
+                    ).value
+                groups.setdefault((address, out.dtype), []).append(index)
+            else:
+                outputs[index] = torch.tensor(out)
+        for indices in groups.values():
+            arrays_out = [outputs[i] for i in indices]
+            address = frame.output_descriptors[indices[0]].allocated
+            borrowed_global = (
+                address not in addresses
+                and owners_by_address.get(address) is None
+            )
+            tensors = _output_tensors(arrays_out, borrowed_global)
+            for index, array, result in zip(indices, arrays_out, tensors):
+                outputs[index] = (
+                    result.view(torch.bfloat16)
+                    if array.dtype == np.uint16
+                    else result
+                )
+        return outputs

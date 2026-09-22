@@ -19,11 +19,13 @@ class AliasEngine:
     def __init__(self, array, outputs=1):
         self.descriptor = type(rt.get_ranked_memref_descriptor(array))
         self.output_type = type(
-            "Outputs", (ctypes.Structure,),
+            "Outputs",
+            (ctypes.Structure,),
             {"_fields_": [(str(i), self.descriptor) for i in range(outputs)]},
         )
         self.graph = SimpleNamespace(
-            _func_name="alias", _output_descriptor=self.output_type,
+            _func_name="alias",
+            _output_descriptor=self.output_type,
             _output_memref=[None] * outputs,
         )
         self.lookups = 0
@@ -45,21 +47,30 @@ class AliasEngine:
         for i in range(len(self.graph._output_memref)):
             target = getattr(output, str(i))
             ctypes.memmove(
-                ctypes.addressof(target), ctypes.addressof(source),
+                ctypes.addressof(target),
+                ctypes.addressof(source),
                 ctypes.sizeof(source),
             )
 
 
 class TestExecution(unittest.TestCase):
     def make_execution(self, tensor, outputs=1):
-        array = tensor.numpy() if tensor.dtype != torch.bfloat16 else tensor.float().numpy().view(np.uint32).astype(np.uint16)
+        array = (
+            tensor.numpy()
+            if tensor.dtype != torch.bfloat16
+            else tensor.float().numpy().view(np.uint32).astype(np.uint16)
+        )
         engine = AliasEngine(array, outputs)
         return _TorchExecution(engine, engine.graph), engine
 
     def test_reuse_updates_addresses_and_preserves_old_results(self):
         x = torch.arange(8, dtype=torch.float32)
         execute, engine = self.make_execution(x)
-        with patch.object(rt, "get_ranked_memref_descriptor", wraps=rt.get_ranked_memref_descriptor) as build:
+        with patch.object(
+            rt,
+            "get_ranked_memref_descriptor",
+            wraps=rt.get_ranked_memref_descriptor,
+        ) as build:
             first = execute(x)[0]
             frame = execute.local.frame
             second = execute(x + 20)[0]
@@ -83,7 +94,13 @@ class TestExecution(unittest.TestCase):
         torch.testing.assert_close(new, torch.arange(7, dtype=torch.float32))
 
     def test_noncontiguous_and_dtypes(self):
-        for dtype in (torch.float32, torch.float64, torch.int32, torch.int64, torch.bfloat16):
+        for dtype in (
+            torch.float32,
+            torch.float64,
+            torch.int32,
+            torch.int64,
+            torch.bfloat16,
+        ):
             with self.subTest(dtype=dtype):
                 x = torch.arange(16).to(dtype).reshape(4, 4).t()
                 execute, _ = self.make_execution(x)
@@ -94,27 +111,43 @@ class TestExecution(unittest.TestCase):
     def test_bfloat16_all_bit_patterns_and_output_isolation(self):
         # Include signed zeros, subnormals, infinities and every NaN payload.
         bits = np.arange(65536, dtype=np.uint16).reshape(256, 256)
-        original = torch.from_numpy(bits.copy().view(np.int16)).view(torch.bfloat16)
-        for x in (original, original.t(), original[:, ::2], original[:1].expand(8, 256)):
+        original = torch.from_numpy(bits.copy().view(np.int16)).view(
+            torch.bfloat16
+        )
+        for x in (
+            original,
+            original.t(),
+            original[:, ::2],
+            original[:1].expand(8, 256),
+        ):
             with self.subTest(shape=x.shape, stride=x.stride()):
                 execute, _ = self.make_execution(x, outputs=2)
                 expected = x.contiguous().view(torch.int16).numpy().copy()
                 first, second = execute(x)
                 self.assertEqual(first.dtype, torch.bfloat16)
-                np.testing.assert_array_equal(first.view(torch.int16).numpy(), expected)
+                np.testing.assert_array_equal(
+                    first.view(torch.int16).numpy(), expected
+                )
                 self.assertTrue(torch._C._is_alias_of(first, second))
                 execute(torch.zeros_like(x))
                 gc.collect()
-                np.testing.assert_array_equal(second.view(torch.int16).numpy(), expected)
+                np.testing.assert_array_equal(
+                    second.view(torch.int16).numpy(), expected
+                )
                 first.zero_()
                 self.assertEqual(torch.count_nonzero(second).item(), 0)
-                np.testing.assert_array_equal(original.view(torch.int16).numpy().view(np.uint16), bits)
+                np.testing.assert_array_equal(
+                    original.view(torch.int16).numpy().view(np.uint16), bits
+                )
 
     def test_strided_inputs_are_isolated_and_c_order(self):
         base = torch.arange(120, dtype=torch.float32).reshape(10, 12)
         inputs = (
-            base.t(), base[1::2, 2::3], base[:1].expand(8, 12),
-            torch.arange(120, dtype=torch.float32).reshape(2, 3, 4, 5)
+            base.t(),
+            base[1::2, 2::3],
+            base[:1].expand(8, 12),
+            torch.arange(120, dtype=torch.float32)
+            .reshape(2, 3, 4, 5)
             .contiguous(memory_format=torch.channels_last),
             base[:0],
         )
@@ -137,10 +170,12 @@ class TestExecution(unittest.TestCase):
         execute, _ = self.make_execution(x, outputs=2)
         refs = []
         original_array = np.array
+
         def track_array(*args, **kwargs):
             array = original_array(*args, **kwargs)
             refs.append(weakref.ref(array))
             return array
+
         with patch.object(np, "array", side_effect=track_array):
             outputs = execute(x)
         view = outputs[1][::2]
@@ -157,9 +192,11 @@ class TestExecution(unittest.TestCase):
         execute, engine = self.make_execution(x)
         barrier = threading.Barrier(2)
         frames = []
+
         def callback(packed):
             frames.append(packed[0])
             barrier.wait(timeout=10)
+
         engine.callback = callback
         with ThreadPoolExecutor(max_workers=2) as pool:
             first = pool.submit(execute, x)
@@ -174,10 +211,12 @@ class TestExecution(unittest.TestCase):
         execute, engine = self.make_execution(x)
         frames = []
         nested = []
+
         def callback(packed):
             frames.append(packed[0])
             if len(frames) == 1:
                 nested.extend(execute(x + 20))
+
         engine.callback = callback
         outer = execute(x)[0]
         self.assertEqual(len(set(frames)), 2)
@@ -188,8 +227,10 @@ class TestExecution(unittest.TestCase):
     def test_exception_allows_frame_reuse(self):
         x = torch.arange(8, dtype=torch.float32)
         execute, engine = self.make_execution(x)
+
         def fail(packed):
             raise RuntimeError("test callback")
+
         engine.callback = fail
         with self.assertRaisesRegex(RuntimeError, "test callback"):
             execute(x)
@@ -213,8 +254,12 @@ class TestExecution(unittest.TestCase):
             primary_registry=tosa.ops_registry,
             aot_autograd_decomposition=decompositions,
         )
-        with patch("buddy.compiler.frontend._TorchExecution", wraps=_TorchExecution) as create:
-            compiled = torch.compile(model, backend=TorchCompileBackend(compiler))
+        with patch(
+            "buddy.compiler.frontend._TorchExecution", wraps=_TorchExecution
+        ) as create:
+            compiled = torch.compile(
+                model, backend=TorchCompileBackend(compiler)
+            )
             a, b = torch.randn(32), torch.randn(32)
             first = compiled(a, b)
             torch.testing.assert_close(first, model(a, b))
