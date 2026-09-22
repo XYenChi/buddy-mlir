@@ -46,6 +46,19 @@ for size, stride, offset in [
     compiled = torch.compile(model, backend=backend(), fullgraph=True)
     torch.testing.assert_close(compiled(x), model(x))
 
+# Storage offsets are absolute, and strides address storage rather than the
+# logical row-major copy passed to the JIT.
+for x, size, stride, offset in [
+    (torch.arange(12).float().reshape(3, 4).t(), (2, 3), (1, 4), 1),
+    (torch.arange(12).float()[2:10], (4,), (1,), 3),
+    (torch.arange(12).float()[2:10], (4,), (1,), None),
+]:
+    model = Strided(size, stride, offset)
+    compiled = torch.compile(
+        model, backend=backend(), fullgraph=True, dynamic=False
+    )
+    torch.testing.assert_close(compiled(x), model(x), check_stride=True)
+
 model = Overlapping()
 expected_base = torch.arange(12, dtype=torch.float32)
 actual_base = expected_base.clone()

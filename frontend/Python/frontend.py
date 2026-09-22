@@ -1145,6 +1145,15 @@ class DynamoCompiler:
                             node_kwargs=gm_node.kwargs,
                         )
                         buddy_node._torch_op = str(gm_node.target.__name__)
+                        if isinstance(buddy_node, AsStridedOp):
+                            source = gm_node.args[0].meta.get("val")
+                            if isinstance(source, torch.Tensor):
+                                buddy_node.tensor_meta["input_stride"] = tuple(
+                                    source.stride()
+                                )
+                                buddy_node.tensor_meta["input_offset"] = (
+                                    source.storage_offset()
+                                )
                         buddy_node._torch_out_kwarg_names = (
                             self._extract_tensor_out_kwarg_names(gm_node.target)
                         )
@@ -1180,6 +1189,17 @@ class DynamoCompiler:
                 output_nodes = next(
                     n for n in all_nodes if n.op == "output"
                 ).args[0]
+                aliases = {}
+                for index, node in enumerate(output_nodes):
+                    value = node.meta.get("val") if node is not None else None
+                    if isinstance(value, torch.Tensor):
+                        storage = value.untyped_storage()._cdata
+                        aliases.setdefault(storage, []).append(
+                            (index, value.storage_offset())
+                        )
+                alias_groups = [
+                    group for group in aliases.values() if len(group) > 1
+                ]
 
                 def _exec(*args):
                     outs = iter(exec_list(*args))
@@ -1203,9 +1223,16 @@ class DynamoCompiler:
                                 dtype=out.dtype,
                                 device=out.device,
                             )
-                            layout.copy_(out)
+                            # Expanded dimensions share one stored element.
+                            # Copy each unique slice once, then retain the view.
+                            unique = tuple(
+                                slice(0, 1) if stride == 0 else slice(None)
+                                for stride in meta.stride
+                            )
+                            layout[unique].copy_(out[unique])
                             out = layout
                         results.append(out)
+                    _restore_output_aliases(results, alias_groups)
                     return tuple(results)
 
                 return _exec
@@ -1464,6 +1491,37 @@ class DynamoCompiler:
             matmul_vector_size=matmul_vector_size,
             matmul_vector_type=matmul_vector_type,
         )
+
+
+def _restore_output_aliases(outputs, groups):
+    """Restore AOT storage relationships lost by value-only tensor lowering."""
+    for group in groups:
+        first = outputs[group[0][0]]
+        if all(torch._C._is_alias_of(first, outputs[i]) for i, _ in group):
+            continue
+        byte_count = 0
+        for index, offset in group:
+            out = outputs[index]
+            span = (
+                1 + sum((n - 1) * s for n, s in zip(out.shape, out.stride()))
+                if out.numel()
+                else 0
+            )
+            byte_count = max(byte_count, (offset + span) * out.element_size())
+        storage = torch.empty(
+            byte_count, dtype=torch.uint8, device=first.device
+        )
+        for index, offset in group:
+            out = outputs[index]
+            size = out.element_size()
+            base = storage[: byte_count // size * size].view(out.dtype)
+            view = base.as_strided(out.shape, out.stride(), offset)
+            unique = tuple(
+                slice(0, 1) if stride == 0 else slice(None)
+                for stride in out.stride()
+            )
+            view[unique].copy_(out[unique])
+            outputs[index] = view
 
 
 def _specialization_key(args, tensors):

@@ -5110,7 +5110,7 @@ def as_strided_op(
     node: AsStridedOp,
     symbol_table: dict[tuple[str, int], ir.Operation],
 ):
-    """Gather a static strided view from a contiguous tensor storage base.
+    """Gather a static strided view using the source tensor's storage layout.
 
     AOTAutograd supplies a synthetic storage base for aliased inputs. Offsets
     and strides refer to that storage, not to a reshape of its first elements.
@@ -5120,7 +5120,10 @@ def as_strided_op(
     input_shape = list(input_type.shape)
     shape = [int(x) for x in node.args[1]]
     strides = [int(x) for x in node.args[2]]
-    offset = int(node.args[3] or 0) if len(node.args) > 3 else 0
+    input_offset = int(node.tensor_meta.get("input_offset", 0))
+    offset = node.args[3] if len(node.args) > 3 else None
+    offset = input_offset if offset is None else int(offset)
+    offset -= input_offset
     if len(shape) != len(strides) or any(x < 0 for x in shape + strides):
         raise NotImplementedError(
             "as_strided requires static nonnegative sizes/strides"
@@ -5132,12 +5135,29 @@ def as_strided_op(
                 "as_strided requires a static storage base"
             )
         total *= size
+    input_strides = node.tensor_meta.get("input_stride")
+    if input_strides is not None and total:
+        span = 1
+        for dim in sorted(
+            range(len(input_shape)), key=input_strides.__getitem__
+        ):
+            if input_shape[dim] <= 1:
+                continue
+            if input_strides[dim] != span:
+                raise NotImplementedError(
+                    "as_strided requires a dense represented input storage"
+                )
+            span *= input_shape[dim]
     if offset < 0 or (
         all(shape)
         and offset + sum((n - 1) * s for n, s in zip(shape, strides)) >= total
     ):
         raise ValueError("as_strided view exceeds the represented storage base")
-    flat = tosa.ReshapeOp(input_tensor, _const_shape_operand([total])).result
+    flat = None
+    if input_strides is None:
+        flat = tosa.ReshapeOp(
+            input_tensor, _const_shape_operand([total])
+        ).result
     output = tensor.EmptyOp(shape, input_type.element_type)
     result_type = ir.RankedTensorType.get(shape, input_type.element_type)
     op = linalg.GenericOp(
@@ -5161,7 +5181,21 @@ def as_strided_op(
             linear = arith.AddIOp(
                 linear, arith.MulIOp(index, scale).result
             ).result
-        value = tensor.ExtractOp(flat, [linear]).result
+        if input_strides is None:
+            value = tensor.ExtractOp(flat, [linear]).result
+        else:
+            indices = []
+            for size, stride in zip(input_shape, input_strides):
+                if size <= 1:
+                    index = arith.ConstantOp(index_type, 0).result
+                else:
+                    scale = arith.ConstantOp(index_type, stride).result
+                    extent = arith.ConstantOp(index_type, size).result
+                    index = arith.RemUIOp(
+                        arith.DivUIOp(linear, scale).result, extent
+                    ).result
+                indices.append(index)
+            value = tensor.ExtractOp(input_tensor, indices).result
         linalg.YieldOp([value])
     return op
 
