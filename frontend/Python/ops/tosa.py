@@ -344,7 +344,16 @@ def _gen_arith_binary_op(input1, input2, op_func):
 
     broadcasted_result_shp = []
     for dim1, dim2 in zip(norm_input1_shape, norm_input2_shape):
-        broadcasted_result_shp.append(max(dim1, dim2))
+        if dim1 != dim2 and dim1 != 1 and dim2 != 1:
+            raise ValueError(
+                f"Incompatible broadcast dimensions: {dim1}, {dim2}"
+            )
+        broadcasted_result_shp.append(dim2 if dim1 == 1 else dim1)
+    if 0 in broadcasted_result_shp:
+        return tensor.EmptyOp(
+            broadcasted_result_shp,
+            ir.RankedTensorType(input1.type).element_type,
+        )
     if input1_shape != norm_input1_shape:
         input1 = tosa.ReshapeOp(
             input1, _create_shape_operand(norm_input1_shape)
