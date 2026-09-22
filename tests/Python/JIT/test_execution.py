@@ -88,7 +88,7 @@ class TestExecution(unittest.TestCase):
                 x = torch.arange(16).to(dtype).reshape(4, 4).t()
                 execute, _ = self.make_execution(x)
                 actual = execute(x)[0]
-                expected = x.float() if dtype == torch.bfloat16 else x
+                expected = x
                 torch.testing.assert_close(actual, expected)
 
     def test_bfloat16_all_bit_patterns_and_output_isolation(self):
@@ -98,16 +98,16 @@ class TestExecution(unittest.TestCase):
         for x in (original, original.t(), original[:, ::2], original[:1].expand(8, 256)):
             with self.subTest(shape=x.shape, stride=x.stride()):
                 execute, _ = self.make_execution(x, outputs=2)
-                # Preserve the existing Torch widening semantics, including
-                # its handling of NaN payloads on the current architecture.
-                expected = x.contiguous().float().numpy().view(np.uint32).copy()
+                expected = x.contiguous().view(torch.int16).numpy().copy()
                 first, second = execute(x)
-                np.testing.assert_array_equal(first.numpy().view(np.uint32), expected)
-                first.zero_()
-                np.testing.assert_array_equal(second.numpy().view(np.uint32), expected)
+                self.assertEqual(first.dtype, torch.bfloat16)
+                np.testing.assert_array_equal(first.view(torch.int16).numpy(), expected)
+                self.assertTrue(torch._C._is_alias_of(first, second))
                 execute(torch.zeros_like(x))
                 gc.collect()
-                np.testing.assert_array_equal(second.numpy().view(np.uint32), expected)
+                np.testing.assert_array_equal(second.view(torch.int16).numpy(), expected)
+                first.zero_()
+                self.assertEqual(torch.count_nonzero(second).item(), 0)
                 np.testing.assert_array_equal(original.view(torch.int16).numpy().view(np.uint16), bits)
 
     def test_strided_inputs_are_isolated_and_c_order(self):

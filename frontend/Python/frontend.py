@@ -38,7 +38,7 @@ from buddy_mlir.execution_engine import ExecutionEngine
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from ._runtime import _TorchExecution
+from ._runtime import _TorchExecution, prepare_runtime_allocators
 from .graph import DeviceType, Graph, NodeType, TensorDType
 from .graph.operation import *
 from .graph.source_meta import extract_source_meta
@@ -1378,6 +1378,8 @@ class DynamoCompiler:
             matmul_vector_size=matmul_vector_size,
             matmul_vector_type=matmul_vector_type,
         )
+
+        prepare_runtime_allocators(graph)
 
         # Collect dependency libraries.
         lib_extension = get_lib_extension()
