@@ -5075,134 +5075,59 @@ def as_strided_op(
     node: AsStridedOp,
     symbol_table: dict[tuple[str, int], ir.Operation],
 ):
+    """Gather a static strided view from a contiguous tensor storage base.
+
+    AOTAutograd supplies a synthetic storage base for aliased inputs. Offsets
+    and strides refer to that storage, not to a reshape of its first elements.
     """
-    Converts a Buddy AsStridedOp operation to an MLIR operation.
-
-    This operation implements the `as_strided` functionality, allowing
-    a tensor to be viewed with a different shape, stride, or offset.
-
-    This also handles the resize_ semantics when input and output sizes differ:
-    - If shrinking: slice the input (preserving first N elements in row-major order)
-    - If enlarging: pad with zeros
-    - If same size: simple reshape
-
-    Parameters:
-        node (AsStridedOp): The Buddy AsStridedOp node containing the tensor and metadata.
-        symbol_table (dict): A dictionary mapping tensor names to their corresponding MLIR operations.
-
-    Returns:
-        op: An MLIR operation representing the transformed tensor.
-    """
-    input_tensor = symbol_table.get((str(node.args[0]), 0))
+    input_tensor = symbol_table[(str(node.args[0]), 0)]
     input_type = ir.RankedTensorType(input_tensor.type)
-    element_type = input_type.element_type
     input_shape = list(input_type.shape)
-    output_shape = list(node.tensor_meta["shape"])
-
-    input_size = 1
-    output_size = 1
-    for i in input_shape:
-        input_size *= i
-    for i in output_shape:
-        output_size *= i
-
-    if input_size == output_size:
-        # Same size: simple reshape
-        shape_ty = ir.Type.parse(f"!tosa.shape<{len(output_shape)}>")
-        index_ty = ir.IndexType.get()
-        shape_val = tosa.ConstShapeOp(
-            shape_ty,
-            ir.DenseElementsAttr.get(
-                array.array("q", output_shape),
-                type=index_ty,
-                shape=[len(output_shape)],
-            ),
-        ).result
-        op = tosa.ReshapeOp(input_tensor, shape_val)
-    elif output_size < input_size:
-        # Shrinking: flatten, slice, reshape
-        # Step 1: Flatten to 1D
-        flat_shape_ty = ir.Type.parse("!tosa.shape<1>")
-        index_ty = ir.IndexType.get()
-        flat_shape_val = tosa.ConstShapeOp(
-            flat_shape_ty,
-            ir.DenseElementsAttr.get(
-                array.array("q", [input_size]),
-                type=index_ty,
-                shape=[1],
-            ),
-        ).result
-        flattened = tosa.ReshapeOp(input_tensor, flat_shape_val)
-
-        # Step 2: Slice to get first output_size elements
-        slice_type = ir.RankedTensorType.get([output_size], element_type)
-        # Create start and size operands using ConstShapeOp (similar to _create_shape_operand in tosa.py)
-        start_shape_ty = ir.Type.parse("!tosa.shape<1>")
-        start_shape_val = tosa.ConstShapeOp(
-            start_shape_ty,
-            ir.DenseElementsAttr.get(
-                array.array("q", [0]),
-                type=index_ty,
-                shape=[1],
-            ),
-        ).result
-        size_shape_ty = ir.Type.parse("!tosa.shape<1>")
-        size_shape_val = tosa.ConstShapeOp(
-            size_shape_ty,
-            ir.DenseElementsAttr.get(
-                array.array("q", [output_size]),
-                type=index_ty,
-                shape=[1],
-            ),
-        ).result
-        sliced = tosa.SliceOp(
-            slice_type, flattened.result, start_shape_val, size_shape_val
+    shape = [int(x) for x in node.args[1]]
+    strides = [int(x) for x in node.args[2]]
+    offset = int(node.args[3] or 0) if len(node.args) > 3 else 0
+    if len(shape) != len(strides) or any(x < 0 for x in shape + strides):
+        raise NotImplementedError(
+            "as_strided requires static nonnegative sizes/strides"
         )
-
-        # Step 3: Reshape to output shape
-        output_shape_ty = ir.Type.parse(f"!tosa.shape<{len(output_shape)}>")
-        output_shape_val = tosa.ConstShapeOp(
-            output_shape_ty,
-            ir.DenseElementsAttr.get(
-                array.array("q", output_shape),
-                type=index_ty,
-                shape=[len(output_shape)],
-            ),
-        ).result
-        op = tosa.ReshapeOp(sliced.result, output_shape_val)
-    else:
-        # Enlarging: flatten, pad with zeros, reshape
-        padding_size = output_size - input_size
-
-        # Step 1: Flatten input to 1D
-        flat_type = ir.RankedTensorType.get([input_size], element_type)
-        flat_shape = ir._denseI64ArrayAttr(
-            numpy.array([input_size], dtype=numpy.int64), None
-        )
-        flattened = tosa.ReshapeOp(input_tensor, flat_shape)
-
-        # Step 2: Create zero padding tensor
-        if isinstance(element_type, ir.IntegerType):
-            zero_attr = ir.IntegerAttr.get(element_type, 0)
-        else:
-            zero_attr = ir.FloatAttr.get(element_type, 0.0)
-
-        padding_type = ir.RankedTensorType.get([padding_size], element_type)
-        padding_attr = ir.DenseElementsAttr.get_splat(padding_type, zero_attr)
-        padding_tensor = tosa.ConstOp(padding_attr)
-
-        # Step 3: Concatenate input with padding
-        concat_type = ir.RankedTensorType.get([output_size], element_type)
-        padded = tosa.ConcatOp(
-            concat_type, [flattened.result, padding_tensor.result], axis=0
-        )
-
-        # Step 4: Reshape to output shape
-        output_shape_attr = ir._denseI64ArrayAttr(
-            numpy.array(output_shape, dtype=numpy.int64), None
-        )
-        op = tosa.ReshapeOp(padded.result, output_shape_attr)
-
+    total = 1
+    for size in input_shape:
+        if size < 0:
+            raise NotImplementedError(
+                "as_strided requires a static storage base"
+            )
+        total *= size
+    if offset < 0 or (
+        all(shape)
+        and offset + sum((n - 1) * s for n, s in zip(shape, strides)) >= total
+    ):
+        raise ValueError("as_strided view exceeds the represented storage base")
+    flat = tosa.ReshapeOp(input_tensor, _const_shape_operand([total])).result
+    output = tensor.EmptyOp(shape, input_type.element_type)
+    result_type = ir.RankedTensorType.get(shape, input_type.element_type)
+    op = linalg.GenericOp(
+        [result_type],
+        [],
+        [output.result],
+        ir.ArrayAttr.get(
+            [ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(shape)))]
+        ),
+        ir.ArrayAttr.get(
+            [ir.Attribute.parse("#linalg.iterator_type<parallel>")] * len(shape)
+        ),
+    )
+    block = ir.Block.create_at_start(op.region, [input_type.element_type])
+    with ir.InsertionPoint(block):
+        index_type = ir.IndexType.get()
+        linear = arith.ConstantOp(index_type, offset).result
+        for dim, stride in enumerate(strides):
+            index = linalg.IndexOp(dim).result
+            scale = arith.ConstantOp(index_type, stride).result
+            linear = arith.AddIOp(
+                linear, arith.MulIOp(index, scale).result
+            ).result
+        value = tensor.ExtractOp(flat, [linear]).result
+        linalg.YieldOp([value])
     return op
 
 

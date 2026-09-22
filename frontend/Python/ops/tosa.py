@@ -2704,6 +2704,9 @@ def slice_op(node: SliceOp, symbol_table):
     dim = node.args[1]
     start_idx = node.args[2]
     end_idx = node.args[3]
+    step = node.args[4] if len(node.args) > 4 else 1
+    if step <= 0:
+        raise ValueError("slice step must be positive")
 
     sizes = ir.RankedTensorType(input_tensor.type).shape
     dtype = node.tensor_meta["dtype"]
@@ -2734,7 +2737,7 @@ def slice_op(node: SliceOp, symbol_table):
         end_idx = sizes[dim]
 
     new_sizes = [x for x in sizes]
-    new_sizes[dim] = end_idx - start_idx
+    new_sizes[dim] = (end_idx - start_idx + step - 1) // step
     new_sizes_attr = ir._denseI64ArrayAttr(new_sizes, None)
 
     offsets = [0] * len(sizes)
@@ -2742,10 +2745,11 @@ def slice_op(node: SliceOp, symbol_table):
     offsets_attr = ir._denseI64ArrayAttr(offsets, None)
 
     strides = [1] * len(sizes)
+    strides[dim] = step
     strides_attr = ir._denseI64ArrayAttr(strides, None)
 
     extract_slice_result_type = ir.RankedTensorType.get(new_sizes, mlir_dtype)
-    if new_sizes == sizes:
+    if new_sizes == sizes and start_idx == 0 and step == 1:
         return input_tensor
     op = tensor.ExtractSliceOp(
         extract_slice_result_type,
