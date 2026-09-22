@@ -760,6 +760,8 @@ class Graph:
             pm.add("eliminate-empty-tensors")
             pm.add("empty-tensor-to-alloc-tensor")
             pm.add("convert-elementwise-to-linalg")
+            pm.add("func.func(linalg-fuse-elementwise-ops)")
+            pm.add("canonicalize")
             pm.add("one-shot-bufferize{bufferize-function-boundaries}")
             pm.add("expand-strided-metadata")
             pm.add("ownership-based-buffer-deallocation")
