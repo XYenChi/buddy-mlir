@@ -991,6 +991,15 @@ class DynamoCompiler:
                     input_nodes.append(node)
                 else:
                     other_nodes.append(node)
+            if return_type == "buddy":
+                # AOT introduces synthetic bases and backward placeholders.
+                # Their order/count is unrelated to the original Dynamo graph.
+                param_nodes = []
+                buffers_nodes = []
+                input_nodes = [n for n in all_nodes if n.op == "placeholder"]
+                other_nodes = [n for n in all_nodes if n.op != "placeholder"]
+                graph._params_ref = []
+                graph._runtime_inputs_ref = _inputs
             gm_nodes = [
                 (NodeType.FakeNode, param_nodes),
                 (NodeType.FakeNode, buffers_nodes),
@@ -1186,11 +1195,36 @@ class DynamoCompiler:
             if return_type == "buddy":
                 exec_list = self._dynamo_run_for_graph(graph)
 
+                output_nodes = next(
+                    n for n in all_nodes if n.op == "output"
+                ).args[0]
+
                 def _exec(*args):
-                    outs = exec_list(*args)
-                    if len(outs) == 1:
-                        return outs[0]
-                    return tuple(outs)
+                    outs = iter(exec_list(*args))
+                    # AOT's compiler ABI always returns a sequence, including
+                    # singleton results and None slots in backward graphs.
+                    results = []
+                    for node in output_nodes:
+                        if node is None:
+                            results.append(None)
+                            continue
+                        out = next(outs)
+                        meta = node.meta.get("tensor_meta")
+                        if meta is not None and tuple(out.stride()) != tuple(
+                            meta.stride
+                        ):
+                            # Tensor IR carries logical values; recover the AOT
+                            # output layout before its alias/view replay runs.
+                            layout = torch.empty_strided(
+                                out.shape,
+                                meta.stride,
+                                dtype=out.dtype,
+                                device=out.device,
+                            )
+                            layout.copy_(out)
+                            out = layout
+                        results.append(out)
+                    return tuple(results)
 
                 return _exec
             raise ValueError(
@@ -1308,7 +1342,10 @@ class DynamoCompiler:
         return self._imported_graphs
 
     def _dynamo_run_for_graph(
-        self, graph, *, matmul_vector_size: int = 32,
+        self,
+        graph,
+        *,
+        matmul_vector_size: int = 32,
         matmul_vector_type: str = "fixed",
     ):
         """
