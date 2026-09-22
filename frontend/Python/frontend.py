@@ -1059,59 +1059,38 @@ class DynamoCompiler:
                         )
                     elif gm_node.op == "get_attr":
                         if "_tensor_constant" in gm_node.name:
-                            import re
-
-                            stack_trace = gm_node.meta.get("stack_trace") or ""
-                            match = re.search(
-                                r"torch\.tensor\(([-+]?\d+(\.\d+)?), dtype=[a-zA-Z]+\)",
-                                stack_trace,
+                            from torch._subclasses.fake_tensor import (
+                                FakeTensor,
+                                unset_fake_temporarily,
                             )
-                            value = None
-                            if match:
-                                value = float(match.group(1))
-                            val = gm_node.meta.get("val")
-                            if value is None:
-                                if isinstance(val, torch.Tensor):
-                                    if val.numel() == 1:
-                                        value = val.item()
-                                    else:
-                                        # Dense folded tensor constants appear
-                                        # in LLM masks/positions. Preserve the
-                                        # payload so TTIR lowering can emit a
-                                        # real tensor constant instead of a
-                                        # scalar-only placeholder.
-                                        t = val.detach().cpu().contiguous()
-                                        try:
-                                            if t.dtype == torch.bfloat16:
-                                                value = t.float().numpy()
-                                            else:
-                                                value = t.numpy()
-                                        except (TypeError, RuntimeError):
-                                            if t.dtype == torch.bfloat16:
-                                                value = np.asarray(
-                                                    t.tolist(), dtype=np.float32
-                                                )
-                                            else:
-                                                value = np.asarray(t.tolist())
-                                elif isinstance(val, (int, float)):
-                                    value = val
-                            if value is None:
-                                raise NotImplementedError(
-                                    "Unsupported _tensor_constant format"
-                                )
 
-                            gm_node.insert_arg(len(gm_node.args), value)
-                            val = gm_node.meta.get("val")
-                            node_shape = list(val.shape)
+                            # Metadata contains FakeTensors, not constant data.
+                            # Resolve the actual GraphModule attribute instead.
+                            val = _gm
+                            for component in gm_node.target.split("."):
+                                val = getattr(val, component)
+                            if isinstance(val, FakeTensor):
+                                val = val.constant
+                            if not isinstance(val, torch.Tensor):
+                                raise NotImplementedError(
+                                    "Tensor constant has no concrete payload"
+                                )
+                            with unset_fake_temporarily():
+                                t = val.detach().cpu().contiguous()
+                                value = (
+                                    t.view(torch.int16).numpy().view(np.uint16)
+                                    if t.dtype == torch.bfloat16
+                                    else t.numpy()
+                                )
                             node_dtype = self._torch_dtype_translate(
                                 str(val.dtype)
                             )
                             buddy_node = self._create_node(
                                 "_tensor_constant",
                                 gm_node.name,
-                                gm_node.args,
+                                (value,),
                                 node_users,
-                                node_shape,
+                                list(val.shape),
                                 node_dtype,
                                 node_kwargs=gm_node.kwargs,
                             )

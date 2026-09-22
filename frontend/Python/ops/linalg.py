@@ -4805,8 +4805,43 @@ def tensor_constant_op(
     output_shape = list(node.tensor_meta["shape"])
     tensor_type = ir.RankedTensorType.get(output_shape, mlir_dtype)
     value = node.args[0]
-    element = mlir_element_attr_get(dtype, value)
-    attr = ir.DenseElementsAttr.get_splat(tensor_type, element)
+    if isinstance(value, numpy.ndarray):
+        numpy_types = {
+            TensorDType.Float16: numpy.float16,
+            TensorDType.Float32: numpy.float32,
+            TensorDType.Float64: numpy.float64,
+            TensorDType.Int8: numpy.int8,
+            TensorDType.Int32: numpy.int32,
+            TensorDType.Int64: numpy.int64,
+            TensorDType.Bool: numpy.bool_,
+            TensorDType.BFloat16: numpy.float32,
+            TensorDType.Complex64: numpy.complex64,
+            TensorDType.Complex128: numpy.complex128,
+        }
+        if dtype == TensorDType.BFloat16 and value.dtype == numpy.uint16:
+            payload = numpy.ascontiguousarray(value)
+        else:
+            payload = numpy.ascontiguousarray(value, dtype=numpy_types[dtype])
+            if dtype == TensorDType.BFloat16:
+                payload = (payload.view(numpy.uint32) >> 16).astype(
+                    numpy.uint16
+                )
+        if dtype == TensorDType.Bool:
+            # A one-byte packed buffer may be interpreted as a splat by the
+            # bindings. Preserve individual i1 elements, including short masks.
+            literal = (
+                str(value.tolist())
+                .replace("True", "true")
+                .replace("False", "false")
+            )
+            attr = ir.DenseElementsAttr(
+                ir.Attribute.parse(f"dense<{literal}> : {tensor_type}")
+            )
+        else:
+            attr = ir.DenseElementsAttr.get(payload, type=tensor_type)
+    else:
+        element = mlir_element_attr_get(dtype, value)
+        attr = ir.DenseElementsAttr.get_splat(tensor_type, element)
     op = arith.ConstantOp(tensor_type, attr)
     return op
 
