@@ -23,11 +23,14 @@
 # ===---------------------------------------------------------------------------
 
 import contextlib
+import copy
 import ctypes
 import ctypes.util
 import operator
 import os
 import platform
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -1477,6 +1480,73 @@ class TorchCompileBackend:
     def __call__(
         self, gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]
     ):
+        if any(
+            not isinstance(value, torch.Tensor)
+            or any(isinstance(dim, torch.SymInt) for dim in value.shape)
+            for value in example_inputs
+        ):
+            # The native pipeline has static tensor types. Specialize at the
+            # execution boundary where symbolic inputs have concrete values;
+            # every specialization still compiles and runs through Buddy.
+            cache = OrderedDict()
+            lock = threading.RLock()
+
+            def specialize(*args):
+                tensors = [x for x in args if isinstance(x, torch.Tensor)]
+                key = tuple(
+                    (
+                        x.shape,
+                        x.stride(),
+                        x.storage_offset(),
+                        x.dtype,
+                        x.device,
+                        x.requires_grad,
+                    )
+                    if isinstance(x, torch.Tensor)
+                    else (type(x), x)
+                    for x in args
+                ) + tuple(
+                    torch._C._is_alias_of(x, y)
+                    for i, x in enumerate(tensors)
+                    for y in tensors[:i]
+                )
+                with lock:
+                    executable = cache.get(key)
+                    if executable is None:
+                        concrete = torch.fx.GraphModule(
+                            gm, copy.deepcopy(gm.graph)
+                        )
+                        placeholders = [
+                            n
+                            for n in concrete.graph.nodes
+                            if n.op == "placeholder"
+                        ]
+                        for node, value in zip(placeholders, args):
+                            if isinstance(value, torch.Tensor):
+                                continue
+                            for user in list(node.users):
+
+                                def replace(n, value=value, node=node):
+                                    return value if n is node else n
+
+                                user.args = torch.fx.map_arg(user.args, replace)
+                                user.kwargs = torch.fx.map_arg(
+                                    user.kwargs, replace
+                                )
+                            concrete.graph.erase_node(node)
+                        concrete.recompile()
+                        self._compiler._imported_graphs = []
+                        self._compiler._imported_params = {}
+                        executable = self._compiler._compile_fx(
+                            concrete, tensors, return_type="buddy"
+                        )
+                        cache[key] = executable
+                        if len(cache) > 32:
+                            cache.popitem(last=False)
+                    cache.move_to_end(key)
+                return executable(*tensors)
+
+            return specialize
         # Keep per-compile state bounded; torch.compile caches the returned
         # callable per-graph, so this is safe for common use.
         self._compiler._imported_graphs = []
