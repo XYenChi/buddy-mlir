@@ -63,6 +63,19 @@ class TestExecution(unittest.TestCase):
         engine = AliasEngine(array, outputs)
         return _TorchExecution(engine, engine.graph), engine
 
+    def test_lazy_input_flags_preserve_values_and_isolation(self):
+        for x in (
+            torch._neg_view(torch.arange(8).float()),
+            torch.randn(8, dtype=torch.complex64).conj(),
+        ):
+            with self.subTest(dtype=x.dtype):
+                expected = x.resolve_conj().resolve_neg().clone()
+                execute, _ = self.make_execution(expected)
+                result = execute(x)[0]
+                torch.testing.assert_close(result, expected)
+                result.zero_()
+                torch.testing.assert_close(x, expected)
+
     def test_reuse_updates_addresses_and_preserves_old_results(self):
         x = torch.arange(8, dtype=torch.float32)
         execute, engine = self.make_execution(x)

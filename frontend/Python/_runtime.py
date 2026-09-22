@@ -170,6 +170,7 @@ def _copy_tensor_input(tensor):
     """Create an isolated, contiguous ABI buffer without changing BF16 bits."""
     if tensor.device.type != "cpu":
         tensor = tensor.cpu()
+    tensor = tensor.resolve_conj().resolve_neg()
     if tensor.dtype == torch.bfloat16:
         array = tensor.contiguous().view(torch.int16).numpy().view(np.uint16)
         return array.copy()
@@ -189,23 +190,25 @@ def _array_end(array):
     return array.ctypes.data + span + array.itemsize
 
 
-def _output_tensors(arrays, copy_storage):
+def _output_tensors(arrays, copy_storage, start):
     """Build Tensor views sharing one storage for a native allocation."""
     if len(arrays) == 1:
         array = arrays[0].copy() if copy_storage else arrays[0]
         return [torch.from_numpy(array)]
 
-    start = min(array.ctypes.data for array in arrays)
+    start = min(start, *(array.ctypes.data for array in arrays))
     end = max(_array_end(array) for array in arrays)
     buffer = (ctypes.c_byte * (end - start)).from_address(start)
-    storage = np.frombuffer(buffer, dtype=arrays[0].dtype).view(_OwnedArray)
+    storage = np.frombuffer(buffer, dtype=np.uint8).view(_OwnedArray)
     storage.owner = tuple(arrays)
     base = torch.from_numpy(storage)
     if copy_storage:
         # JIT globals may be read-only and must not be mutated by callers.
         base = base.clone()
     return [
-        base.as_strided(
+        base[: (end - start) // array.itemsize * array.itemsize]
+        .view(torch.from_numpy(np.empty(0, dtype=array.dtype)).dtype)
+        .as_strided(
             array.shape,
             tuple(stride // array.itemsize for stride in array.strides),
             (array.ctypes.data - start) // array.itemsize,
@@ -302,7 +305,7 @@ class _TorchExecution:
                     address = ctypes.cast(
                         descriptor.aligned, ctypes.c_void_p
                     ).value
-                groups.setdefault((address, out.dtype), []).append(index)
+                groups.setdefault(address, []).append(index)
             else:
                 outputs[index] = torch.tensor(out)
         for indices in groups.values():
@@ -312,7 +315,13 @@ class _TorchExecution:
                 address not in addresses
                 and owners_by_address.get(address) is None
             )
-            tensors = _output_tensors(arrays_out, borrowed_global)
+            start = min(
+                ctypes.cast(
+                    frame.output_descriptors[i].aligned, ctypes.c_void_p
+                ).value
+                for i in indices
+            )
+            tensors = _output_tensors(arrays_out, borrowed_global, start)
             for index, array, result in zip(indices, arrays_out, tensors):
                 outputs[index] = (
                     result.view(torch.bfloat16)
