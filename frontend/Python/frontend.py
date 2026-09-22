@@ -34,11 +34,11 @@ from typing import Any
 import numpy as np
 import torch
 import torch._dynamo as dynamo
-from buddy_mlir import runtime as rt
 from buddy_mlir.execution_engine import ExecutionEngine
 from torch._functorch.aot_autograd import aot_module_simplified
 from torch.fx.experimental.proxy_tensor import make_fx
 
+from ._runtime import _TorchExecution
 from .graph import DeviceType, Graph, NodeType, TensorDType
 from .graph.operation import *
 from .graph.source_meta import extract_source_meta
@@ -1415,87 +1415,14 @@ class DynamoCompiler:
             enable_pic=platform.machine().startswith("riscv"),
         )
 
-        def exec_buddy_graph(*args):
-            """
-            Execute a graph using TorchDynamo with the provided input tensors.
-
-            Args:
-                *args: list[torch.Tensor]
-                Input tensors to be passed to the graph's function.
-
-            Returns:
-            list[torch.Tensor]
-                The result of executing the graph, represented as a list of
-                output tensors.
-            """
-
-            def _bf16_tensor_to_numpy_uint16(
-                tensor: torch.Tensor,
-            ) -> np.ndarray:
-                """
-                Convert a CPU bfloat16 tensor to a NumPy uint16 array containing
-                raw BF16 bit patterns (to avoid torch.bfloat16 -> numpy errors).
-                """
-                if tensor.device.type != "cpu":
-                    tensor = tensor.cpu()
-                # BF16 stores the top 16 bits of float32. Casting BF16->F32 is exact.
-                f32 = tensor.to(dtype=torch.float32).contiguous().numpy()
-                u32 = f32.view(np.uint32)
-                return (u32 >> 16).astype(np.uint16, copy=False)
-
-            def _bf16_uint16_numpy_to_f32(npy: np.ndarray) -> np.ndarray:
-                """
-                Convert a NumPy uint16 array (BF16 bit patterns) to float32 NumPy.
-                """
-                u32 = np.asarray(npy, dtype=np.uint32) << 16
-                return u32.view(np.float32)
-
-            def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
-                if tensor.device.type != "cpu":
-                    tensor = tensor.cpu()
-                tensor = tensor.contiguous()
-                if tensor.dtype == torch.bfloat16:
-                    return _bf16_tensor_to_numpy_uint16(tensor)
-                return tensor.numpy()
-
-            input_arrays = []
-            input_descs = []
-            input_slots = []
-            for tensor in args:
-                npy = _tensor_to_numpy(tensor)
-                npy = np.array(npy, copy=True)
-                input_arrays.append(npy)
-                desc = rt.get_ranked_memref_descriptor(npy)
-                input_descs.append(desc)
-                input_slots.append(ctypes.pointer(ctypes.pointer(desc)))
-
-            output_struct = graph._output_descriptor()
-            output_ptr = ctypes.pointer(output_struct)
-            output_slot = ctypes.pointer(output_ptr)
-
-            ee.invoke(graph._func_name, output_slot, *input_slots)
-
-            output_tensors = []
-            for i in range(len(graph._output_memref)):
-                out_desc = getattr(output_struct, str(i))
-                out = rt.ranked_memref_to_numpy(ctypes.pointer(out_desc))
-                if isinstance(out, np.ndarray) and out.dtype == np.uint16:
-                    out = _bf16_uint16_numpy_to_f32(out)
-                if isinstance(out, np.ndarray):
-                    output_tensors.append(torch.from_numpy(out))
-                else:
-                    output_tensors.append(torch.tensor(out))
-            return output_tensors
-
-        return exec_buddy_graph
+        return _TorchExecution(ee, graph)
 
     def dynamo_run(self):
         """
-        A callable method that wraps around the `exec_buddy_graph` method.
+        Return a callable for the most recently imported graph.
 
-        Returns:
-            exec_buddy_graph: The function of the ahead-of-time compiled module,
-            return for torchdynamo's call.
+        The callable caches JIT argument descriptors per thread and refreshes
+        their input addresses on each invocation.
         """
         # Dynamo's graph break may import more than one graph.
         graph = self._imported_graphs[-1]
